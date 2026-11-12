@@ -14,11 +14,14 @@ Percorre marcas -> modelos -> anos -> preco, converte o valor para numerico (BRL
 | --- | --- | --- |
 | `vehicle_type` | `carros`, `motos` ou `caminhoes` | `carros` |
 | `brand_filter` | Filtra por nome ou codigo da marca | vazio |
+| `model_filter` | Filtra modelos cujo nome contem o termo (varios termos separados por virgula) | vazio |
 | `max_brands` | Maximo de marcas (0 = todas) | `2` |
 | `max_models` | Maximo de modelos por marca (0 = todos) | `3` |
 | `max_years` | Maximo de anos por modelo (0 = todos) | `0` |
 | `sleep_seconds` | Pausa entre requisicoes | `0.5` |
 | `table` / destino | Tabela de destino | `main.default.fipe_prices` |
+
+Exemplo: todos os anos do Honda Fit -> `brand_filter=honda`, `model_filter=fit`, `max_brands=0`, `max_models=0`, `max_years=0`.
 
 Os valores padrao fazem uma execucao de teste pequena. Use `0` nos limites para fazer o crawl completo, que gera milhares de requisicoes.
 

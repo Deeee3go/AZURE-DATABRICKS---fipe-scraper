@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # DBTITLE 1,Title
 # MAGIC %md
 # MAGIC # FIPE Brazilian Vehicle Prices Scraper
@@ -11,6 +15,7 @@
 # Parameters (0 = no limit). Defaults are a small test run.
 dbutils.widgets.dropdown("vehicle_type", "carros", ["carros", "motos", "caminhoes"], "Vehicle type")
 dbutils.widgets.text("brand_filter", "", "Brand filter (name contains or code)")
+dbutils.widgets.text("model_filter", "", "Model filter (name contains, comma-separated)")
 dbutils.widgets.text("max_brands", "2", "Max brands (0 = all)")
 dbutils.widgets.text("max_models", "3", "Max models per brand (0 = all)")
 dbutils.widgets.text("max_years", "0", "Max years per model (0 = all)")
@@ -22,6 +27,7 @@ dbutils.widgets.dropdown("write_mode", "merge", ["merge", "append"], "Write mode
 
 VEHICLE_TYPE = dbutils.widgets.get("vehicle_type")
 BRAND_FILTER = dbutils.widgets.get("brand_filter").strip()
+MODEL_FILTER = [t.strip().lower() for t in dbutils.widgets.get("model_filter").split(",") if t.strip()]
 MAX_BRANDS = int(dbutils.widgets.get("max_brands") or 0)
 MAX_MODELS = int(dbutils.widgets.get("max_models") or 0)
 MAX_YEARS = int(dbutils.widgets.get("max_years") or 0)
@@ -29,7 +35,7 @@ SLEEP_SECONDS = float(dbutils.widgets.get("sleep_seconds") or 0.5)
 TARGET_TABLE = f"{dbutils.widgets.get('catalog')}.{dbutils.widgets.get('schema')}.{dbutils.widgets.get('table')}"
 WRITE_MODE = dbutils.widgets.get("write_mode")
 
-print(f"type={VEHICLE_TYPE} brand_filter='{BRAND_FILTER}' max_brands={MAX_BRANDS} "
+print(f"type={VEHICLE_TYPE} brand_filter='{BRAND_FILTER}' model_filter={MODEL_FILTER} max_brands={MAX_BRANDS} "
       f"max_models={MAX_MODELS} max_years={MAX_YEARS} sleep={SLEEP_SECONDS}s target={TARGET_TABLE} mode={WRITE_MODE}")
 
 # COMMAND ----------
@@ -96,7 +102,7 @@ print("parse_brl OK")
 # DBTITLE 1,Crawler
 from datetime import datetime, timezone
 
-def crawl(vehicle_type, brand_filter="", max_brands=0, max_models=0, max_years=0):
+def crawl(vehicle_type, brand_filter="", max_brands=0, max_models=0, max_years=0, model_filter=None):
     rows, errors = [], []
     brands = get_json(f"/{vehicle_type}/marcas")
     if brand_filter:
@@ -112,6 +118,9 @@ def crawl(vehicle_type, brand_filter="", max_brands=0, max_models=0, max_years=0
             models = get_json(f"/{vehicle_type}/marcas/{b_code}/modelos")["modelos"]
         except Exception as e:
             errors.append((b_code, None, None, str(e))); continue
+        if model_filter:
+            # keep models whose name contains any of the terms (case-insensitive), e.g. ["fit"]
+            models = [m for m in models if any(t in m["nome"].lower() for t in model_filter)]
         if max_models:
             models = models[:max_models]
         print(f"- {b_name} ({b_code}): {len(models)} model(s)")
@@ -156,7 +165,7 @@ from pyspark.sql.types import (StructType, StructField, StringType, IntegerType,
                                DecimalType, TimestampType)
 
 t0 = time.time()
-rows, errors = crawl(VEHICLE_TYPE, BRAND_FILTER, MAX_BRANDS, MAX_MODELS, MAX_YEARS)
+rows, errors = crawl(VEHICLE_TYPE, BRAND_FILTER, MAX_BRANDS, MAX_MODELS, MAX_YEARS, MODEL_FILTER)
 print(f"\nCollected {len(rows)} price rows, {len(errors)} error(s) in {time.time() - t0:.0f}s; stats={stats}")
 for e in errors[:10]:
     print("  error:", e)
