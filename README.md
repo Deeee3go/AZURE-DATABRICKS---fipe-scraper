@@ -25,6 +25,21 @@ Exemplo: todos os anos do Honda Fit -> `brand_filter=honda`, `model_filter=fit`,
 
 Os valores padrao fazem uma execucao de teste pequena. Use `0` nos limites para fazer o crawl completo, que gera milhares de requisicoes.
 
+## Modelo estrela (para visualizações)
+
+Após a coleta, o notebook monta um modelo estrela a partir dos preços:
+
+| Tabela | Conteúdo |
+| --- | --- |
+| `fato_preco_fipe` | 1 linha por código FIPE + ano-modelo + mês de referência: preço (BRL), idade, chaves |
+| `dim_marca` | tipo de veículo, código e nome da marca |
+| `dim_modelo` | modelo, família (ex.: Fit), motor, câmbio |
+| `dim_ano_modelo` | ano-modelo e indicador 0 km |
+| `dim_combustivel` | combustível |
+| `dim_tempo` | mês de referência como data, ano e mês |
+
+Chaves substitutas determinísticas (`xxhash64`). Com Unity Catalog grava em Delta (`catalog.schema`); sem metastore grava Parquet em `fipe_output/star/` e registra temp views. Inclui um exemplo de visualização: preço médio do Honda Fit por ano-modelo e câmbio.
+
 ## Recursos
 
 * Retry com backoff exponencial para respostas 429, 5xx e erros de rede

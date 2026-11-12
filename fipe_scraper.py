@@ -1,8 +1,4 @@
 # Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "6"
-# ///
 # DBTITLE 1,Title
 # MAGIC %md
 # MAGIC # FIPE Brazilian Vehicle Prices Scraper
@@ -12,18 +8,18 @@
 # COMMAND ----------
 
 # DBTITLE 1,Widgets
-# Parameters (0 = no limit). Defaults are a small test run.
-dbutils.widgets.dropdown("vehicle_type", "carros", ["carros", "motos", "caminhoes"], "Vehicle type")
-dbutils.widgets.text("brand_filter", "", "Brand filter (name contains or code)")
-dbutils.widgets.text("model_filter", "", "Model filter (name contains, comma-separated)")
-dbutils.widgets.text("max_brands", "2", "Max brands (0 = all)")
-dbutils.widgets.text("max_models", "3", "Max models per brand (0 = all)")
-dbutils.widgets.text("max_years", "0", "Max years per model (0 = all)")
-dbutils.widgets.text("sleep_seconds", "0.5", "Sleep between calls (s)")
-dbutils.widgets.text("catalog", "main", "Target catalog")
-dbutils.widgets.text("schema", "default", "Target schema")
-dbutils.widgets.text("table", "fipe_prices", "Target table")
-dbutils.widgets.dropdown("write_mode", "merge", ["merge", "append"], "Write mode")
+# Parâmetros (0 = sem limite). Os valores padrão fazem uma execução de teste pequena.
+dbutils.widgets.dropdown("vehicle_type", "carros", ["carros", "motos", "caminhoes"], "Tipo de veículo")
+dbutils.widgets.text("brand_filter", "", "Filtro de marca (nome contém ou código)")
+dbutils.widgets.text("model_filter", "", "Filtro de modelo (nome contém, separado por vírgula)")
+dbutils.widgets.text("max_brands", "2", "Máx. de marcas (0 = todas)")
+dbutils.widgets.text("max_models", "3", "Máx. de modelos por marca (0 = todos)")
+dbutils.widgets.text("max_years", "0", "Máx. de anos por modelo (0 = todos)")
+dbutils.widgets.text("sleep_seconds", "0.5", "Pausa entre requisições (s)")
+dbutils.widgets.text("catalog", "main", "Catálogo de destino")
+dbutils.widgets.text("schema", "default", "Schema de destino")
+dbutils.widgets.text("table", "fipe_prices", "Tabela de destino")
+dbutils.widgets.dropdown("write_mode", "merge", ["merge", "append"], "Modo de escrita")
 
 VEHICLE_TYPE = dbutils.widgets.get("vehicle_type")
 BRAND_FILTER = dbutils.widgets.get("brand_filter").strip()
@@ -279,3 +275,157 @@ SELECT vehicle_type, brand, reference_month, COUNT(*) AS rows, ROUND(AVG(price_b
 FROM fipe_out GROUP BY ALL ORDER BY brand
 """))
 display(tbl.orderBy("brand", "model", "model_year").limit(20))
+
+# COMMAND ----------
+
+# DBTITLE 1,Modelo estrela
+# MAGIC %md
+# MAGIC ## Modelo estrela para visualizações
+# MAGIC
+# MAGIC Grão da fato: **1 linha por código FIPE + ano-modelo + mês de referência**.
+# MAGIC
+# MAGIC * `fato_preco_fipe`: preço (BRL), idade do veículo, chaves para as dimensões
+# MAGIC * `dim_marca`, `dim_modelo` (família, motor, câmbio), `dim_combustivel`, `dim_tempo` (mês de referência), `dim_ano_modelo`
+# MAGIC
+# MAGIC Chaves substitutas determinísticas (`xxhash64` das chaves naturais), estáveis entre execuções. Destino: Delta em `catalog.schema` quando houver Unity Catalog; senão Parquet em `fipe_output/star/` + temp views com os mesmos nomes.
+
+# COMMAND ----------
+
+# DBTITLE 1,Construir dimensões e fato
+from pyspark.sql import functions as F
+
+src = spark.table("fipe_out")  # criada na célula de validação (Delta ou Parquet)
+
+MESES = {"janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4, "maio": 5, "junho": 6,
+         "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12}
+mes_map = F.create_map(*[F.lit(x) for kv in MESES.items() for x in kv])
+ZERO_KM = 32000  # convenção da FIPE para veículo 0 km
+
+base = (src
+    .withColumn("_mes_nome", F.lower(F.trim(F.split("reference_month", " de ")[0])))
+    .withColumn("_ano_ref", F.split("reference_month", " de ")[1].cast("int"))
+    .withColumn("data_referencia", F.make_date("_ano_ref", F.try_element_at(mes_map, F.col("_mes_nome")), F.lit(1)))
+    .withColumn("combustivel", F.coalesce("fuel", F.lit("Não informado")))
+    .withColumn("motor", F.nullif(F.regexp_extract("model", r"(\d\.\d)", 1), F.lit("")))
+    .withColumn("cambio", F.when(F.col("model").rlike(r"(?i)\baut"), "Automático")
+                           .when(F.col("model").rlike(r"(?i)\bmec"), "Manual")
+                           .otherwise("Não informado"))
+    .withColumn("sk_marca", F.xxhash64("vehicle_type", "brand_code"))
+    .withColumn("sk_modelo", F.xxhash64("vehicle_type", "brand_code", "model_code"))
+    .withColumn("sk_combustivel", F.xxhash64("combustivel"))
+    .withColumn("sk_data_ref", F.date_format("data_referencia", "yyyyMM").cast("int"))
+)
+
+dim_marca = (base.select("sk_marca", F.col("vehicle_type").alias("tipo_veiculo"),
+                         F.col("brand_code").alias("codigo_marca"), F.col("brand").alias("marca"))
+             .dropDuplicates(["sk_marca"]))
+
+dim_modelo = (base.select("sk_modelo", "sk_marca", F.col("model_code").alias("codigo_modelo"),
+                          F.col("model").alias("modelo"), F.split("model", " ")[0].alias("familia"),
+                          "motor", "cambio")
+              .dropDuplicates(["sk_modelo"]))
+
+dim_combustivel = base.select("sk_combustivel", "combustivel").dropDuplicates(["sk_combustivel"])
+
+dim_tempo = (base.select("sk_data_ref", "data_referencia",
+                         F.year("data_referencia").alias("ano"), F.month("data_referencia").alias("mes"),
+                         F.col("reference_month").alias("mes_referencia"))
+             .dropDuplicates(["sk_data_ref"]))
+
+dim_ano_modelo = (base.select(F.col("model_year").alias("ano_modelo")).distinct()
+                  .withColumn("is_zero_km", F.col("ano_modelo") == ZERO_KM)
+                  .withColumn("ano_modelo_label", F.when(F.col("is_zero_km"), "0 km")
+                                                   .otherwise(F.col("ano_modelo").cast("string"))))
+
+fato_preco_fipe = base.select(
+    "sk_marca", "sk_modelo", "sk_combustivel", "sk_data_ref",
+    F.col("model_year").alias("ano_modelo"),
+    F.col("fipe_code").alias("codigo_fipe"),
+    F.col("price_brl").alias("preco_brl"),
+    F.when(F.col("model_year") != ZERO_KM, F.col("_ano_ref") - F.col("model_year")).alias("idade_anos"),
+    F.col("scraped_at").alias("coletado_em"),
+)
+
+STAR = {"dim_marca": dim_marca, "dim_modelo": dim_modelo, "dim_combustivel": dim_combustivel,
+        "dim_tempo": dim_tempo, "dim_ano_modelo": dim_ano_modelo, "fato_preco_fipe": fato_preco_fipe}
+fato_preco_fipe.printSchema()
+
+# COMMAND ----------
+
+# DBTITLE 1,Gravar tabelas do modelo estrela
+STAR_DIR = f"{FALLBACK_DIR}/star"
+
+def save_star_table(name, df):
+    """Delta (overwrite) quando há Unity Catalog; senão Parquet em workspace files. Sempre registra uma temp view."""
+    if OUTPUT_SINK == "delta":
+        full = f"{dbutils.widgets.get('catalog')}.{dbutils.widgets.get('schema')}.{name}"
+        df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(full)
+        spark.table(full).createOrReplaceTempView(name)
+        return full, spark.table(full).count()
+    os.makedirs(STAR_DIR, exist_ok=True)
+    path = f"{STAR_DIR}/{name}.parquet"
+    # decimais -> double; collect() em vez de toPandas() (evita erro de serialização do Spark Connect)
+    out = df.select([F.col(f.name).cast("double") if isinstance(f.dataType, DecimalType) else F.col(f.name)
+                     for f in df.schema.fields])
+    pdf = pd.DataFrame([r.asDict() for r in out.collect()], columns=out.columns)
+    pdf.to_parquet(path, index=False)
+    df.createOrReplaceTempView(name)
+    return path, len(pdf)
+
+for name, df in STAR.items():
+    dest, n = save_star_table(name, df)
+    print(f"{name:<16} {n:>6} linhas -> {dest}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Validar modelo estrela e exemplo de consulta
+# Integridade: fato deve ter o mesmo nº de linhas da origem e nenhuma chave órfã
+display(spark.sql("""
+SELECT (SELECT COUNT(*) FROM fipe_out)        AS linhas_origem,
+       COUNT(*)                                AS linhas_fato,
+       COUNT_IF(m.sk_marca IS NULL)            AS orfaos_marca,
+       COUNT_IF(mo.sk_modelo IS NULL)          AS orfaos_modelo,
+       COUNT_IF(c.sk_combustivel IS NULL)      AS orfaos_combustivel,
+       COUNT_IF(t.sk_data_ref IS NULL)         AS orfaos_tempo,
+       COUNT_IF(a.ano_modelo IS NULL)          AS orfaos_ano_modelo
+FROM fato_preco_fipe f
+LEFT JOIN dim_marca m        ON f.sk_marca = m.sk_marca
+LEFT JOIN dim_modelo mo      ON f.sk_modelo = mo.sk_modelo
+LEFT JOIN dim_combustivel c  ON f.sk_combustivel = c.sk_combustivel
+LEFT JOIN dim_tempo t        ON f.sk_data_ref = t.sk_data_ref
+LEFT JOIN dim_ano_modelo a   ON f.ano_modelo = a.ano_modelo
+"""))
+
+# Exemplo para visualização: preço médio por família, ano-modelo e câmbio
+display(spark.sql("""
+SELECT m.marca, mo.familia, a.ano_modelo_label AS ano_modelo, mo.cambio,
+       COUNT(*) AS versoes, ROUND(AVG(f.preco_brl), 2) AS preco_medio_brl,
+       MIN(f.preco_brl) AS preco_min_brl, MAX(f.preco_brl) AS preco_max_brl
+FROM fato_preco_fipe f
+JOIN dim_marca m       ON f.sk_marca = m.sk_marca
+JOIN dim_modelo mo     ON f.sk_modelo = mo.sk_modelo
+JOIN dim_ano_modelo a  ON f.ano_modelo = a.ano_modelo
+GROUP BY ALL
+ORDER BY m.marca, mo.familia, a.ano_modelo_label, mo.cambio
+"""))
+
+# COMMAND ----------
+
+# DBTITLE 1,Visualização: preço médio do Honda Fit por ano-modelo e câmbio
+# Exemplo de visualização: curva de preço FIPE do Honda Fit (gráfico de linhas sobre este resultado)
+fit_preco_por_ano = spark.sql("""
+SELECT f.ano_modelo,
+       mo.cambio,
+       COUNT(*)                     AS versoes,
+       ROUND(AVG(f.preco_brl), 2)   AS preco_medio_brl,
+       MIN(f.preco_brl)             AS preco_min_brl,
+       MAX(f.preco_brl)             AS preco_max_brl
+FROM fato_preco_fipe f
+JOIN dim_marca m    ON f.sk_marca = m.sk_marca
+JOIN dim_modelo mo  ON f.sk_modelo = mo.sk_modelo
+WHERE m.marca = 'Honda' AND mo.familia = 'Fit'
+  AND f.ano_modelo <> 32000            -- exclui 0 km
+GROUP BY f.ano_modelo, mo.cambio
+ORDER BY f.ano_modelo, mo.cambio
+""")
+display(fit_preco_por_ano)
